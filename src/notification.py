@@ -17,6 +17,8 @@ A股自选股智能分析系统 - 通知层
 from __future__ import annotations
 
 import logging
+import os
+import re
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -1252,6 +1254,123 @@ class NotificationService(
             signal_tag,
         )
 
+    # ============================================================
+    # 详略分级渲染（issue: 个股报告过长）
+    # 买入/加仓/持有 -> 完整决策仪表盘；卖出/减仓/规避/预警 -> 精简块
+    # 由环境变量控制：REPORT_COMPACT_DETAIL / REPORT_COMPACT_ACTIONS
+    # ============================================================
+    _COMPACT_ACTIONS_DEFAULT = ("reduce", "sell", "avoid", "alert")
+    _COMPACT_DISABLED_VALUES = {"none", "off", "false", "0", "no"}
+
+    def _compact_action_set(self) -> set:
+        """Resolve which decision actions should render as compact blocks.
+
+        ``REPORT_COMPACT_ACTIONS`` accepts a comma/space separated action list
+        (``buy``/``add``/``hold``/``reduce``/``sell``/``watch``/``avoid``/``alert``).
+        Empty, ``none`` or ``off`` disables compact rendering completely.
+        """
+        raw = os.getenv("REPORT_COMPACT_ACTIONS")
+        if raw is None:
+            items = tuple(self._COMPACT_ACTIONS_DEFAULT)
+        else:
+            items = tuple(
+                part.strip().lower()
+                for part in re.split(r"[,;\s]+", raw)
+                if part.strip()
+            )
+        if not items or set(items) <= self._COMPACT_DISABLED_VALUES:
+            return set()
+        return set(items)
+
+    def _is_compact_detail(
+        self,
+        result: AnalysisResult,
+        report_language: Optional[str] = None,
+    ) -> bool:
+        """Whether this stock should be rendered as a short compact block."""
+        if os.getenv("REPORT_COMPACT_DETAIL", "true").strip().lower() in self._COMPACT_DISABLED_VALUES:
+            return False
+        allowed = self._compact_action_set()
+        if not allowed:
+            return False
+        language = report_language or self._get_report_language(result)
+        action: Any = None
+        try:
+            fields = display_action_fields_for_result(result, report_language=language)
+            if isinstance(fields, dict):
+                action = fields.get("action")
+        except Exception:
+            action = None
+        if action is None:
+            try:
+                action = display_decision_type_for_result(result, report_language=language)
+            except Exception:
+                action = None
+        return str(action or "").strip().lower() in allowed
+
+    def _append_compact_stock_block(
+        self,
+        lines: List[str],
+        result: AnalysisResult,
+        labels: Dict[str, str],
+        report_language: Optional[str],
+        signal_text: str,
+        signal_emoji: str,
+    ) -> None:
+        """Render a compact block for negative-signal stocks (详情被刻意压缩）."""
+        dashboard = result.dashboard if getattr(result, 'dashboard', None) else {}
+        if not isinstance(dashboard, dict):
+            dashboard = {}
+        core = dashboard.get('core_conclusion') if isinstance(dashboard.get('core_conclusion'), dict) else {}
+        battle = dashboard.get('battle_plan') if isinstance(dashboard.get('battle_plan'), dict) else {}
+        intel = dashboard.get('intelligence') if isinstance(dashboard.get('intelligence'), dict) else {}
+        stock_name = self._get_display_name(result, report_language)
+
+        lines.extend([
+            f"## {signal_emoji} {stock_name} ({result.code})",
+            "",
+            f"> {labels['score_label']}: **{result.sentiment_score}** | "
+            f"{localize_trend_prediction(result.trend_prediction, report_language)} | {signal_text}",
+            "",
+        ])
+
+        one_sentence = core.get('one_sentence') or result.analysis_summary
+        if one_sentence:
+            lines.extend([
+                f"**{labels['one_sentence_label']}**: {str(one_sentence)[:120]}",
+                "",
+            ])
+
+        pos_advice = core.get('position_advice') if isinstance(core.get('position_advice'), dict) else {}
+        no_position = pos_advice.get('no_position') or self._get_display_operation_advice(result, report_language)
+        has_position = pos_advice.get('has_position') or labels.get('continue_holding', '继续持有')
+        lines.extend([
+            f"**{labels['action_advice_label']}**: "
+            f"🆕 {labels['no_position_label']} → {no_position} | "
+            f"💼 {labels['has_position_label']} → {has_position}",
+            "",
+        ])
+
+        risks = intel.get('risk_alerts') if isinstance(intel.get('risk_alerts'), list) else []
+        if risks:
+            alert_text = "；".join(str(item)[:40] for item in risks[:2])
+            lines.extend([
+                f"🚨 **{labels['risk_alerts_label']}**: {alert_text}",
+                "",
+            ])
+
+        sniper = battle.get('sniper_points') if isinstance(battle.get('sniper_points'), dict) else {}
+        if sniper:
+            point_parts = []
+            stop_loss = self._clean_sniper_value(sniper.get('stop_loss'))
+            take_profit = self._clean_sniper_value(sniper.get('take_profit'))
+            if stop_loss and stop_loss != 'N/A':
+                point_parts.append(f"🛑 {labels['stop_loss_label']}: {stop_loss}")
+            if take_profit and take_profit != 'N/A':
+                point_parts.append(f"🎊 {labels['take_profit_label']}: {take_profit}")
+            if point_parts:
+                lines.extend([" | ".join(point_parts), ""])
+
     def generate_dashboard_report(
         self,
         results: List[AnalysisResult],
@@ -1347,6 +1466,23 @@ class NotificationService(
         if not self._report_summary_only:
             for result in sorted_results:
                 signal_text, signal_emoji, signal_tag = self._get_signal_level(result)
+
+                # 详略分级：卖出/减仓/规避/预警 走精简块，把篇幅留给买入/持有标的
+                if self._is_compact_detail(result, report_language):
+                    self._append_compact_stock_block(
+                        report_lines,
+                        result,
+                        labels,
+                        report_language,
+                        signal_text,
+                        signal_emoji,
+                    )
+                    report_lines.extend([
+                        "---",
+                        "",
+                    ])
+                    continue
+
                 dashboard = result.dashboard if hasattr(result, 'dashboard') and result.dashboard else {}
 
                 # 股票名称（优先使用 dashboard 或 result 中的名称，转义 *ST 等特殊字符）
