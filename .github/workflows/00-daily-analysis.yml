@@ -461,8 +461,13 @@ jobs:
             echo "✅ LITELLM 配置文件已写入: $LITELLM_CONFIG"
           fi
 
-          # 判断运行模式
-          MODE="${{ github.event.inputs.mode || 'full' }}"
+          # ============== 核心修改1：定时触发强制 full 完整模式 ==============
+          if [[ "${{ github.event_name }}" == "schedule" ]]; then
+            MODE="full"
+            echo "⏰ 定时任务触发，强制使用完整模式（大盘复盘 + 个股分析）"
+          else
+            MODE="${{ github.event.inputs.mode || 'full' }}"
+          fi
           
           echo "=========================================="
           echo "🚀 A股自选股智能分析系统"
@@ -532,6 +537,18 @@ jobs:
           echo "  Slack: $(([ -n "$SLACK_WEBHOOK_URL" ] || ([ -n "$SLACK_BOT_TOKEN" ] && [ -n "$SLACK_CHANNEL_ID" ])) && echo '✅ 已配置' || echo '⚪ 未配置')"
           echo "=========================================="
           echo ""
+
+          # ============== 核心修改2：个股配置检查日志 ==============
+          echo "📋 个股分析前置检查"
+          if [ -n "$STOCK_LIST" ] && [ "$STOCK_LIST" != "600519" ]; then
+            echo "  ✅ 自选股已自定义配置，个股分析将正常执行"
+          elif [ "$STOCK_LIST" = "600519" ]; then
+            echo "  ⚠️  当前使用默认示例股票（600519）"
+            echo "  💡 请在 Settings → Variables 配置 STOCK_LIST 添加你的自选股"
+          else
+            echo "  ❌ 自选股列表为空，将仅生成大盘复盘"
+          fi
+          echo ""
           
           # 构建命令行参数
           FORCE_RUN_ARG=""
@@ -540,13 +557,17 @@ jobs:
             echo "⚡ 已启用强制运行模式（跳过交易日检查）"
           fi
 
-          # 执行分析
-          if [ "$MODE" = "market-only" ]; then
+          # ============== 核心修改3：显式分模式执行 ==============
+          echo "🚀 开始执行分析..."
+          if [ "$MODE" = "full" ]; then
+            echo "  模式：完整分析（大盘复盘 + 个股分析）"
+            python main.py $FORCE_RUN_ARG
+          elif [ "$MODE" = "market-only" ]; then
+            echo "  模式：仅大盘复盘"
             python main.py --market-review $FORCE_RUN_ARG
           elif [ "$MODE" = "stocks-only" ]; then
+            echo "  模式：仅个股分析"
             python main.py --no-market-review $FORCE_RUN_ARG
-          else
-            python main.py $FORCE_RUN_ARG
           fi
       
       - name: 上传分析报告
@@ -577,3 +598,4 @@ jobs:
             echo "📜 最近日志（最后 30 行）:"
             tail -30 logs/stock_analysis_*.log 2>/dev/null || echo "无日志"
           fi
+
