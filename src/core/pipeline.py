@@ -3516,6 +3516,8 @@ class StockAnalysisPipeline:
             )
         
         results: List[AnalysisResult] = []
+        # 记录每只股票的失败原因：个股全部失败时用于显式告警与日志定位
+        failures: List[Tuple[str, str]] = []
         
         # 使用线程池并发处理
         # 注意：max_workers 设置较低（默认3）以避免触发反爬
@@ -3558,9 +3560,11 @@ class StockAnalysisPipeline:
                                 fallback_code=code,
                             )
                     elif result and not result.success:
+                        failure_reason = result.error_message or "未知原因"
+                        failures.append((code, failure_reason))
                         logger.warning(
                             f"[{code}] 分析结果标记为失败，不计入汇总: "
-                            f"{result.error_message or '未知原因'}"
+                            f"{failure_reason}"
                         )
 
                     # Issue #128: 分析间隔 - 在个股分析和大盘分析之间添加延迟
@@ -3573,10 +3577,26 @@ class StockAnalysisPipeline:
                         time.sleep(analysis_delay)
 
                 except Exception as e:
+                    failures.append((code, f"任务执行异常: {e}"))
                     logger.error(f"[{code}] 任务执行失败: {e}")
         
         # 统计
         elapsed_time = time.time() - start_time
+
+        # 个股全部失败时显式暴露原因。
+        # 原实现只在日志里逐条 warning，results 为空时静默跳过个股推送，
+        # 表现为「只收到大盘复盘，收不到个股」，且无法从推送侧定位原因。
+        if not results and stock_codes and not dry_run:
+            failure_detail = "; ".join(
+                f"{code}: {reason}" for code, reason in failures
+            ) or "未捕获到失败明细（可能全部任务被跳过）"
+            logger.error(
+                "个股分析全部失败：共 %d 只，均未产出分析结果，本轮不会生成个股日报。失败明细: %s",
+                len(stock_codes),
+                failure_detail,
+            )
+            if send_notification:
+                self._send_stock_failure_alert(stock_codes, failures)
         
         # dry-run 模式下，数据获取成功即视为成功
         if dry_run:
@@ -3623,6 +3643,65 @@ class StockAnalysisPipeline:
                 self._send_notifications(results, report_type)
         
         return results
+
+    def _send_stock_failure_alert(
+        self,
+        stock_codes: List[str],
+        failures: List[Tuple[str, str]],
+    ) -> None:
+        """个股全部失败时推送一条告警，避免「只收到大盘、个股静默消失」。
+
+        仅在确实存在失败明细时发送；先走 alert 路由（若用户配置了告警渠道），
+        未送达时回退到 report 路由，保证用户一定能看到失败原因。
+        """
+        if not failures:
+            return
+        try:
+            if not self.notifier.is_available():
+                logger.warning("通知渠道不可用，跳过个股失败告警推送")
+                return
+
+            lines: List[str] = [
+                "# ⚠️ 个股分析全部失败",
+                "",
+                f"本轮 {len(stock_codes)} 只自选股全部未产出分析结果，因此没有个股日报推送。",
+                "",
+                "## 失败原因",
+            ]
+            for code, reason in failures[:10]:
+                lines.append(f"- {code}: {reason}")
+            if len(failures) > 10:
+                lines.append(f"- …… 其余 {len(failures) - 10} 只同类失败")
+            lines.extend([
+                "",
+                "## 常见原因",
+                "- 个股行情/日线数据源不可用（GitHub 海外 runner 访问东财、腾讯、AKShare 常见超时或被限流）",
+                "- LLM 渠道额度不足或触发限流（个股调用次数远多于大盘复盘）",
+                "- STOCK_LIST 中的代码格式有误（如混入中文名、全角逗号、非 6 位代码）",
+                "",
+                "> 请在 Actions 日志中检索 `分析失败` / `任务执行失败` 查看完整堆栈。",
+            ])
+            content = "\n".join(lines)
+
+            send_kwargs: Dict[str, Any] = {"email_send_to_all": True}
+            try:
+                if "route_type" in inspect.signature(self.notifier.send).parameters:
+                    send_kwargs["route_type"] = "alert"
+            except (TypeError, ValueError):
+                pass
+
+            if self.notifier.send(content, **send_kwargs):
+                logger.info("已推送「个股分析全部失败」告警")
+                return
+            # alert 路由未命中任何渠道时回退到 report 路由（与大盘复盘同一条通道）
+            if send_kwargs.get("route_type") == "alert":
+                send_kwargs["route_type"] = "report"
+                if self.notifier.send(content, **send_kwargs):
+                    logger.info("已通过 report 路由推送「个股分析全部失败」告警")
+                    return
+            logger.warning("「个股分析全部失败」告警推送失败")
+        except Exception:
+            logger.exception("发送「个股分析全部失败」告警时异常")
 
     def _send_single_stock_notification(
         self,
