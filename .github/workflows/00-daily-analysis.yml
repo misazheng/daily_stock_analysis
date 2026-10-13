@@ -1,9 +1,10 @@
 name: 每日股票分析
 
 on:
-  # 定时触发 - 北京时间 早上 08:00（UTC 00:00）
+  # 定时触发 - 每天北京时间 18:00 (UTC 10:00)
   schedule:
-    - cron: '0 0 * * 1-5'  # UTC 00:00，周一至周五，对应北京时间 08:00
+    - cron: '0 10 * * 1-5'     # 周一到周五，UTC 10:00 = 北京时间 18:00
+  
   # 手动触发
   workflow_dispatch:
     inputs:
@@ -13,10 +14,9 @@ on:
         default: 'full'
         type: choice
         options:
-          - full        # 完整分析（股票+大盘）
-          - market-only # 仅大盘复盘
-          - stocks-only # 仅股票分析
-
+          - full          # 完整分析（股票+大盘）
+          - market-only   # 仅大盘复盘
+          - stocks-only   # 仅股票分析
       force_run:
         description: '强制运行（跳过交易日检查）'
         required: false
@@ -60,6 +60,41 @@ jobs:
         run: |
           mkdir -p data logs reports
       
+      - name: 预检（自选股 / 通知渠道 / 交易日）
+        if: ${{ always() }}
+        continue-on-error: true
+        run: |
+          echo "=========================================="
+          echo "🔍 预检：自选股解析"
+          echo "=========================================="
+          RAW_STOCK_LIST=""
+          SRC_LABEL="❌ 未配置"
+          if [ -n "${STOCK_LIST_CONFIG:-}" ]; then
+            RAW_STOCK_LIST="$STOCK_LIST_CONFIG"; SRC_LABEL="vars.STOCK_LIST / secrets.STOCK_LIST"
+          elif [ -n "${STOCK_LIST:-}" ]; then
+            RAW_STOCK_LIST="$STOCK_LIST";        SRC_LABEL="Environment variables → STOCK_LIST"
+          fi
+          NORMALIZED="$(printf '%s' "$RAW_STOCK_LIST" \
+            | sed -e 's/，/,/g' -e 's/、/,/g' -e 's/；/,/g' -e 's/;/,/g' -e 's/　/,/g' \
+            | tr -d '[:space:]' \
+            | tr 'a-z' 'A-Z' \
+            | sed -e 's/,,*/,/g' -e 's/^,//' -e 's/,$//')"
+          echo "  来源:     $SRC_LABEL"
+          echo "  原始值:   [$RAW_STOCK_LIST]"
+          echo "  归一化后: [$NORMALIZED]"
+          if [ -z "$NORMALIZED" ]; then
+            echo "  ⚠️ 未读取到任何自选股配置，主流程将回退到默认示例股 600519。"
+            echo "     → 请在 Settings → Secrets and variables → Actions → Variables 配置 STOCK_LIST"
+          else
+            echo "  ✅ 自选股配置已就绪，将分析: $NORMALIZED"
+          fi
+          echo ""
+          echo "=========================================="
+          echo "🔍 预检：通知渠道（只读，不发送）"
+          echo "=========================================="
+          python main.py --check-notify 2>&1 | tail -40 || true
+          echo ""
+
       - name: 执行股票分析
         env:
           # ==========================================
@@ -441,41 +476,64 @@ jobs:
           REALTIME_SOURCE_PRIORITY: ${{ vars.REALTIME_SOURCE_PRIORITY || 'tencent,akshare_sina,efinance,akshare_em' }}
           
         run: |
-          # 解析自选股配置：
-          # 1. Repository/Environment secrets 或 Repository variables（STOCK_LIST_CONFIG）
-          # 2. 同名 Environment variables 注入的 runner 环境变量（STOCK_LIST）
-          # 3. 最小默认值
+          # ==========================================================
+          # 自选股解析：多来源 + 分隔符归一化 + 显式校验
+          #   1) Repository/Environment Variables|Secrets → STOCK_LIST_CONFIG
+          #   2) 同名 Environment variables 注入的 runner 环境变量 → STOCK_LIST
+          #   3) 兜底最小默认值 600519（并给出显式警告）
+          # ==========================================================
+          RAW_STOCK_LIST=""
+          STOCK_LIST_SOURCE="❌ 未配置"
           if [ -n "${STOCK_LIST_CONFIG:-}" ]; then
-            export STOCK_LIST="$STOCK_LIST_CONFIG"
-          elif [ -z "${STOCK_LIST:-}" ]; then
+            RAW_STOCK_LIST="$STOCK_LIST_CONFIG"; STOCK_LIST_SOURCE="vars/secrets.STOCK_LIST"
+          elif [ -n "${STOCK_LIST:-}" ]; then
+            RAW_STOCK_LIST="$STOCK_LIST";        STOCK_LIST_SOURCE="Environment variables → STOCK_LIST"
+          fi
+
+          STOCK_LIST="$(printf '%s' "$RAW_STOCK_LIST" \
+            | sed -e 's/，/,/g' -e 's/、/,/g' -e 's/；/,/g' -e 's/;/,/g' -e 's/　/,/g' \
+            | tr -d '[:space:]' \
+            | tr 'a-z' 'A-Z' \
+            | sed -e 's/,,*/,/g' -e 's/^,//' -e 's/,$//')"
+
+          if [ -n "$STOCK_LIST" ]; then
+            export STOCK_LIST
+          else
             export STOCK_LIST="600519"
+            STOCK_LIST_SOURCE="⚠️ 未读取到配置，回退内置默认值"
           fi
 
           # 处理 LITELLM YAML 配置文件
-          if [ -n "$LITELLM_CONFIG_YAML" ] && [ -n "$LITELLM_CONFIG" ]; then
+          if [ -n "${LITELLM_CONFIG_YAML:-}" ] && [ -n "${LITELLM_CONFIG:-}" ]; then
             echo "📝 使用 GitHub Actions Secrets/Variables 中的 LITELLM_CONFIG_YAML 配置"
-            # 确保目录存在
             mkdir -p "$(dirname "$LITELLM_CONFIG")"
-            # 写入配置文件（覆盖已有文件）
             echo "$LITELLM_CONFIG_YAML" > "$LITELLM_CONFIG"
             echo "✅ LITELLM 配置文件已写入: $LITELLM_CONFIG"
           fi
 
-          # ============== 核心修改1：定时触发强制 full 完整模式 ==============
-          if [[ "${{ github.event_name }}" == "schedule" ]]; then
+          # ============== 运行模式：定时触发强制 full ==============
+          if [ "${{ github.event_name }}" = "schedule" ]; then
             MODE="full"
             echo "⏰ 定时任务触发，强制使用完整模式（大盘复盘 + 个股分析）"
           else
             MODE="${{ github.event.inputs.mode || 'full' }}"
+            if [ "$MODE" != "full" ] && [ "$MODE" != "market-only" ] && [ "$MODE" != "stocks-only" ]; then
+              echo "⚠️ 未知运行模式 '$MODE'，回退为 full"
+              MODE="full"
+            fi
           fi
-          
+
           echo "=========================================="
           echo "🚀 A股自选股智能分析系统"
           echo "=========================================="
           echo "⏰ 时间: $(TZ='Asia/Shanghai' date '+%Y-%m-%d %H:%M:%S')"
           echo "🎯 运行模式: $MODE"
+          echo "📊 自选股来源: $STOCK_LIST_SOURCE"
           echo "📊 自选股: $STOCK_LIST"
           echo "📝 报告类型: $REPORT_TYPE"
+          echo "🔔 单股即时推送 SINGLE_STOCK_NOTIFY: $SINGLE_STOCK_NOTIFY"
+          echo "📈 大盘复盘 MARKET_REVIEW_ENABLED: $MARKET_REVIEW_ENABLED"
+          echo "🗓  交易日检查 TRADING_DAY_CHECK_ENABLED: $TRADING_DAY_CHECK_ENABLED"
           echo ""
           echo "=========================================="
           echo "📋 配置检查"
@@ -504,27 +562,9 @@ jobs:
           else
             echo "  Longbridge: ⚪ 未配置（仅 YFinance 等，无长桥调用）"
           fi
+          echo "  实时行情优先级: $REALTIME_SOURCE_PRIORITY"
           echo ""
-          echo "【搜索引擎】"
-          echo "  Bocha API Keys: $([ -n "$BOCHA_API_KEYS" ] && echo '✅ 已配置' || echo '⚪ 未配置')"
-          echo "  Tavily API Keys: $([ -n "$TAVILY_API_KEYS" ] && echo '✅ 已配置' || echo '⚪ 未配置')"
-          echo "  SerpAPI Keys: $([ -n "$SERPAPI_API_KEYS" ] && echo '✅ 已配置' || echo '⚪ 未配置')"
-          echo "  MiniMax API Keys: $([ -n "$MINIMAX_API_KEYS" ] && echo '✅ 已配置' || echo '⚪ 未配置')"
-          echo "  Brave API Keys: $([ -n "$BRAVE_API_KEYS" ] && echo '✅ 已配置' || echo '⚪ 未配置')"
-          echo "  SearXNG Base URLs: $([ -n "$SEARXNG_BASE_URLS" ] && echo '✅ 已配置' || echo '⚪ 未配置')"
-          case "${SEARXNG_PUBLIC_INSTANCES_ENABLED,,}" in
-            0|false|no|off)
-              echo "  SearXNG Public Instances: ❌ 已禁用"
-              ;;
-            "")
-              echo "  SearXNG Public Instances: ⚪ 默认关闭（公共实例普遍限流，如需启用请显式设为 true）"
-              ;;
-            *)
-              echo "  SearXNG Public Instances: ✅ 已启用"
-              ;;
-          esac
-          echo ""
-          echo "【通知渠道】"
+          echo "【通知渠道】（个股日报与大盘复盘走同一条 report 路由）"
           echo "  PushPlus: $([ -n "$PUSHPLUS_TOKEN" ] && echo '✅ 已配置' || echo '⚪ 未配置')"
           echo "  ntfy: $([ -n "$NTFY_URL" ] && echo '✅ 已配置' || echo '⚪ 未配置')"
           echo "  Gotify: $([ -n "$GOTIFY_URL" ] && [ -n "$GOTIFY_TOKEN" ] && echo '✅ 已配置' || echo '⚪ 未配置')"
@@ -535,21 +575,27 @@ jobs:
           echo "  Discord: $([ -n "$DISCORD_WEBHOOK_URL" ] && echo '✅ 已配置' || echo '⚪ 未配置')"
           echo "  AstrBot: $([ -n "$ASTRBOT_URL" ] && echo '✅ 已配置' || echo '⚪ 未配置')"
           echo "  Slack: $(([ -n "$SLACK_WEBHOOK_URL" ] || ([ -n "$SLACK_BOT_TOKEN" ] && [ -n "$SLACK_CHANNEL_ID" ])) && echo '✅ 已配置' || echo '⚪ 未配置')"
+          echo "  NOTIFICATION_REPORT_CHANNELS: [${NOTIFICATION_REPORT_CHANNELS:-}]（留空=全部渠道）"
+          echo "  NOTIFICATION_ALERT_CHANNELS:  [${NOTIFICATION_ALERT_CHANNELS:-}]（留空=全部渠道）"
           echo "=========================================="
           echo ""
 
-          # ============== 核心修改2：个股配置检查日志 ==============
+          # ============== 个股前置检查 ==============
           echo "📋 个股分析前置检查"
-          if [ -n "$STOCK_LIST" ] && [ "$STOCK_LIST" != "600519" ]; then
-            echo "  ✅ 自选股已自定义配置，个股分析将正常执行"
-          elif [ "$STOCK_LIST" = "600519" ]; then
-            echo "  ⚠️  当前使用默认示例股票（600519）"
-            echo "  💡 请在 Settings → Variables 配置 STOCK_LIST 添加你的自选股"
+          if [ "$STOCK_LIST" = "600519" ]; then
+            echo "  ⚠️  当前自选股为内置默认值（600519），个股分析只会分析这一只"
+            echo "  💡 请在 Settings → Secrets and variables → Actions → Variables 配置 STOCK_LIST"
+          elif [ -n "$STOCK_LIST" ]; then
+            echo "  ✅ 自选股已配置，个股分析将正常执行: $STOCK_LIST"
           else
             echo "  ❌ 自选股列表为空，将仅生成大盘复盘"
           fi
+          if [ "$MARKET_REVIEW_ENABLED" = "true" ] && [ "$MODE" = "full" ]; then
+            echo "  ℹ️  full 模式：若日志出现「个股分析全部失败 / 今日休市股票已跳过 / 未配置自选股列表」，"
+            echo "     就会表现为『只收到大盘复盘、收不到个股推送』。往下翻『个股推送诊断摘要』。"
+          fi
           echo ""
-          
+
           # 构建命令行参数
           FORCE_RUN_ARG=""
           if [ "${{ github.event.inputs.force_run }}" = "true" ]; then
@@ -557,19 +603,21 @@ jobs:
             echo "⚡ 已启用强制运行模式（跳过交易日检查）"
           fi
 
-          # ============== 核心修改3：显式分模式执行 ==============
           echo "🚀 开始执行分析..."
-          if [ "$MODE" = "full" ]; then
-            echo "  模式：完整分析（大盘复盘 + 个股分析）"
-            python main.py $FORCE_RUN_ARG
-          elif [ "$MODE" = "market-only" ]; then
+          if [ "$MODE" = "market-only" ]; then
             echo "  模式：仅大盘复盘"
             python main.py --market-review $FORCE_RUN_ARG
           elif [ "$MODE" = "stocks-only" ]; then
             echo "  模式：仅个股分析"
             python main.py --no-market-review $FORCE_RUN_ARG
+          else
+            echo "  模式：完整分析（大盘复盘 + 个股分析）"
+            python main.py $FORCE_RUN_ARG
           fi
-      
+          STATUS=$?
+          echo "python main.py 退出码: $STATUS"
+          exit $STATUS
+
       - name: 上传分析报告
         uses: actions/upload-artifact@v6
         if: always()
@@ -579,23 +627,45 @@ jobs:
             reports/
             logs/
           retention-days: 30
-      
-      - name: 显示运行结果
+
+      - name: 个股推送诊断摘要
         if: always()
         run: |
           echo ""
           echo "=========================================="
-          echo "📊 分析完成"
+          echo "🔎 个股推送诊断摘要"
           echo "=========================================="
-          if [ -d "reports" ] && [ "$(ls -A reports 2>/dev/null)" ]; then
-            echo "生成的报告:"
-            ls -la reports/
+          LOG_FILE="$(ls -1t logs/stock_analysis_*.log 2>/dev/null | head -1 || true)"
+          if [ -z "$LOG_FILE" ]; then
+            echo "⚠️ 未找到 logs/stock_analysis_*.log，Python 主程序可能未执行到日志初始化。"
           else
-            echo "⚠️ 未生成报告文件"
+            echo "日志文件: $LOG_FILE"
+            echo ""
+            echo "--- 关键行 ---"
+            grep -E "GitHub Actions 默认 STOCK_LIST|开始分析 [0-9]+ 只股票|成功: [0-9]+, 失败: [0-9]+|今日休市股票已跳过|今日所有相关市场均为非交易日|未配置自选股列表|单股推送模式|合并推送模式|个股分析全部失败|分析失败|任务执行失败|通知渠道|发送通知" "$LOG_FILE" 2>/dev/null | tail -80 || true
+            echo ""
+            echo "--- 结论 ---"
+            if grep -q "个股分析全部失败" "$LOG_FILE" 2>/dev/null; then
+              echo "❌ 个股全部分析失败 → 本轮不会有个股推送。"
+              echo "   往上翻『[股票代码] 分析失败』的具体报错，通常是数据源不可用或 LLM 额度/限流。"
+            elif grep -q "未配置自选股列表" "$LOG_FILE" 2>/dev/null; then
+              echo "❌ STOCK_LIST 解析为空 → 个股环节被整体跳过，只剩大盘复盘。"
+              echo "   检查 Settings → Secrets and variables → Actions → Variables 的 STOCK_LIST。"
+            elif grep -q "今日所有相关市场均为非交易日" "$LOG_FILE" 2>/dev/null; then
+              echo "⚠️ 今日为非交易日 → 整个流程被跳过，可用 force_run=true 或 --force-run 强制执行。"
+            elif grep -qE "成功: [1-9][0-9]*, 失败:" "$LOG_FILE" 2>/dev/null; then
+              echo "✅ 个股分析有成功结果，个股日报应该已经推送（走与大盘复盘相同的 report 路由）。"
+            elif grep -qE "成功: 0, 失败: [0-9]+" "$LOG_FILE" 2>/dev/null; then
+              echo "❌ 个股成功 0 只 → 不会有个股推送，请看上面的失败报错。"
+            else
+              echo "ℹ️ 未命中已知模式，请人工查看上方关键行与完整日志。"
+            fi
           fi
           echo ""
-          if [ -f "logs/stock_analysis_$(date +%Y%m%d).log" ]; then
-            echo "📜 最近日志（最后 30 行）:"
-            tail -30 logs/stock_analysis_*.log 2>/dev/null || echo "无日志"
+          echo "--- 生成的报告文件 ---"
+          if [ -d "reports" ] && [ "$(ls -A reports 2>/dev/null)" ]; then
+            ls -la reports/ | head -20
+          else
+            echo "⚠️ reports/ 目录为空：本轮没有落盘任何报告。"
           fi
-
+          echo ""
