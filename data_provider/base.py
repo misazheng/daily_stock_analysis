@@ -3344,6 +3344,23 @@ class DataFetcherManager:
     def get_market_stats(self, *, purpose: str = "unspecified") -> Dict[str, Any]:
         """获取市场涨跌统计（自动切换数据源）"""
         logger.info("[MarketStats] component=market_stats action=start purpose=%s", purpose)
+        # ---- 轻量市场统计兜底（双源：东财clist → 新浪分页），失败自动回退原链路 ----
+        try:
+            from data_provider.light_market_stats import fetch_light_market_stats
+            _light = fetch_light_market_stats()
+        except Exception as _e:
+            logger.warning("[MarketStats] component=market_stats provider=LightAggregate action=init_failed error=%s", _e)
+            _light = None
+        if _light:
+            logger.info(
+                "[MarketStats] component=market_stats provider=LightAggregate action=success "
+                "rows=%s counted=%s up=%s down=%s flat=%s limit_up=%s limit_down=%s amount=%.2f",
+                _light.get("total_count"), _light.get("counted_count"), _light.get("up_count"),
+                _light.get("down_count"), _light.get("flat_count"), _light.get("limit_up_count"),
+                _light.get("limit_down_count"), _light.get("total_amount"),
+            )
+            return _light
+
         tickflow_fetcher = self._get_tickflow_fetcher()
         if tickflow_fetcher is not None:
             started_at = time.monotonic()
