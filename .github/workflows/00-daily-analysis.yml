@@ -513,7 +513,7 @@ jobs:
 
           # ============== 运行模式：定时触发强制 full ==============
           if [ "${{ github.event_name }}" = "schedule" ]; then
-            MODE="full"
+                        MODE="${{ vars.RUN_MODE || 'market-only' }}"
             echo "⏰ 定时任务触发，强制使用完整模式（大盘复盘 + 个股分析）"
           else
             MODE="${{ github.event.inputs.mode || 'full' }}"
